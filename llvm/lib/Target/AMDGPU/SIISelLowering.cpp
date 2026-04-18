@@ -8163,6 +8163,12 @@ bool SITargetLowering::shouldUseLDSConstAddress(const GlobalValue *GV) const {
   if (!GV->hasExternalLinkage())
     return true;
 
+  // RDC-ISA: extern LDS declarations need linker-resolved offsets.
+  if (AMDGPU::EnableRDCISA &&
+      isa<GlobalVariable>(GV) && GV->isDeclaration() &&
+      GV->getType()->getPointerAddressSpace() == AMDGPUAS::LOCAL_ADDRESS)
+    return false;
+
   const auto OS = getTargetMachine().getTargetTriple().getOS();
   return OS == Triple::AMDHSA || OS == Triple::AMDPAL;
 }
@@ -9513,34 +9519,40 @@ SDValue SITargetLowering::LowerGlobalAddress(AMDGPUMachineFunctionInfo *MFI,
   EVT PtrVT = Op.getValueType();
 
   const GlobalValue *GV = GSD->getGlobal();
+
+  // Handle dynamic LDS (zero-size extern shared) before the const-address
+  // check, so it works correctly regardless of shouldUseLDSConstAddress.
+  if (GSD->getAddressSpace() == AMDGPUAS::LOCAL_ADDRESS &&
+      GV->hasExternalLinkage()) {
+    const GlobalVariable &GVar = *cast<GlobalVariable>(GV);
+    // HIP uses an unsized array `extern __shared__ T s[]` or similar
+    // zero-sized type in other languages to declare the dynamic shared
+    // memory which size is not known at the compile time. They will be
+    // allocated by the runtime and placed directly after the static
+    // allocated ones. They all share the same offset.
+    if (GVar.getGlobalSize(GVar.getDataLayout()) == 0) {
+      assert(PtrVT == MVT::i32 && "32-bit pointer is expected.");
+      Function &F = DAG.getMachineFunction().getFunction();
+      MFI->setDynLDSAlign(F, GVar);
+      MFI->setUsesDynamicLDS(true);
+      return SDValue(
+          DAG.getMachineNode(AMDGPU::GET_GROUPSTATICSIZE, DL, PtrVT), 0);
+    }
+  }
+
   if ((GSD->getAddressSpace() == AMDGPUAS::LOCAL_ADDRESS &&
        shouldUseLDSConstAddress(GV)) ||
       GSD->getAddressSpace() == AMDGPUAS::REGION_ADDRESS ||
       GSD->getAddressSpace() == AMDGPUAS::PRIVATE_ADDRESS) {
-    if (GSD->getAddressSpace() == AMDGPUAS::LOCAL_ADDRESS &&
-        GV->hasExternalLinkage()) {
-      const GlobalVariable &GVar = *cast<GlobalVariable>(GV);
-      // HIP uses an unsized array `extern __shared__ T s[]` or similar
-      // zero-sized type in other languages to declare the dynamic shared
-      // memory which size is not known at the compile time. They will be
-      // allocated by the runtime and placed directly after the static
-      // allocated ones. They all share the same offset.
-      if (GVar.getGlobalSize(GVar.getDataLayout()) == 0) {
-        assert(PtrVT == MVT::i32 && "32-bit pointer is expected.");
-        // Adjust alignment for that dynamic shared memory array.
-        Function &F = DAG.getMachineFunction().getFunction();
-        MFI->setDynLDSAlign(F, GVar);
-        MFI->setUsesDynamicLDS(true);
-        return SDValue(
-            DAG.getMachineNode(AMDGPU::GET_GROUPSTATICSIZE, DL, PtrVT), 0);
-      }
-    }
     return AMDGPUTargetLowering::LowerGlobalAddress(MFI, Op, DAG);
   }
 
   if (GSD->getAddressSpace() == AMDGPUAS::LOCAL_ADDRESS) {
+    unsigned TF = (AMDGPU::EnableRDCISA && GV->isDeclaration())
+                      ? SIInstrInfo::MO_LDS_OFFSET
+                      : SIInstrInfo::MO_ABS32_LO;
     SDValue GA = DAG.getTargetGlobalAddress(GV, DL, MVT::i32, GSD->getOffset(),
-                                            SIInstrInfo::MO_ABS32_LO);
+                                            TF);
     return DAG.getNode(AMDGPUISD::LDS, DL, MVT::i32, GA);
   }
 

@@ -199,6 +199,8 @@ namespace llvm {
 
 namespace AMDGPU {
 
+bool EnableRDCISA = false;
+
 /// \returns true if the target supports signed immediate offset for SMRD
 /// instructions.
 bool hasSMRDSignedImmOffset(const MCSubtargetInfo &ST) {

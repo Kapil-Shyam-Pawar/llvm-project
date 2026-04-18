@@ -3265,7 +3265,8 @@ bool AMDGPULegalizerInfo::legalizeGlobalValue(
   if (AS == AMDGPUAS::LOCAL_ADDRESS || AS == AMDGPUAS::REGION_ADDRESS) {
     if (!MFI->isModuleEntryFunction() &&
         GV->getName() != "llvm.amdgcn.module.lds" &&
-        !AMDGPU::isNamedBarrier(*cast<GlobalVariable>(GV))) {
+        !AMDGPU::isNamedBarrier(*cast<GlobalVariable>(GV)) &&
+        !AMDGPU::EnableRDCISA) {
       const Function &Fn = MF.getFunction();
       Fn.getContext().diagnose(DiagnosticInfoUnsupported(
           Fn, "local memory global used by non-kernel function",
@@ -3282,15 +3283,8 @@ bool AMDGPULegalizerInfo::legalizeGlobalValue(
       return true;
     }
 
-    // TODO: We could emit code to handle the initialization somewhere.
-    // We ignore the initializer for now and legalize it to allow selection.
-    // The initializer will anyway get errored out during assembly emission.
-    const SITargetLowering *TLI = ST.getTargetLowering();
-    if (!TLI->shouldUseLDSConstAddress(GV)) {
-      MI.getOperand(1).setTargetFlags(SIInstrInfo::MO_ABS32_LO);
-      return true; // Leave in place;
-    }
-
+    // Handle dynamic LDS (zero-size extern shared) before the const-address
+    // check, so it works correctly regardless of shouldUseLDSConstAddress.
     const GlobalVariable &GVar = *cast<GlobalVariable>(GV);
     if (AS == AMDGPUAS::LOCAL_ADDRESS && GV->hasExternalLinkage()) {
       // HIP uses an unsized array `extern __shared__ T s[]` or similar
@@ -3307,6 +3301,18 @@ bool AMDGPULegalizerInfo::legalizeGlobalValue(
         MI.eraseFromParent();
         return true;
       }
+    }
+
+    // TODO: We could emit code to handle the initialization somewhere.
+    // We ignore the initializer for now and legalize it to allow selection.
+    // The initializer will anyway get errored out during assembly emission.
+    const SITargetLowering *TLI = ST.getTargetLowering();
+    if (!TLI->shouldUseLDSConstAddress(GV)) {
+      unsigned TF = (AMDGPU::EnableRDCISA && GV->isDeclaration())
+                        ? SIInstrInfo::MO_LDS_OFFSET
+                        : SIInstrInfo::MO_ABS32_LO;
+      MI.getOperand(1).setTargetFlags(TF);
+      return true; // Leave in place;
     }
 
     B.buildConstant(DstReg, MFI->allocateLDSGlobal(B.getDataLayout(), GVar));

@@ -552,6 +552,12 @@ static cl::opt<bool, true> EnableLowerModuleLDS(
     cl::location(AMDGPUTargetMachine::EnableLowerModuleLDS), cl::init(true),
     cl::Hidden);
 
+static cl::opt<bool, true> EnableRDCISAOpt(
+    "amdgpu-rdc-isa",
+    cl::desc("Enable relocatable device code with ISA linking mode"),
+    cl::location(AMDGPU::EnableRDCISA), cl::init(false),
+    cl::Hidden);
+
 static cl::opt<bool> EnablePreRAOptimizations(
     "amdgpu-enable-pre-ra-optimizations",
     cl::desc("Enable Pre-RA optimizations pass"), cl::init(true),

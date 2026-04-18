@@ -54,6 +54,7 @@ public:
     S_ABS32_LO,      // symbol@abs32@lo
     S_ABS32_HI,      // symbol@abs32@hi
     S_ABS64,         // symbol@abs64
+    S_LDS_OFFSET,   // symbol@lds_offset — linker-assigned LDS offset
   };
 
 private:

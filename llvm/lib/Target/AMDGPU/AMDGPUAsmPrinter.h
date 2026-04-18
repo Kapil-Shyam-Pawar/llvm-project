@@ -16,6 +16,7 @@
 
 #include "AMDGPUMCResourceInfo.h"
 #include "SIProgramInfo.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/CodeGen/AsmPrinter.h"
 
 namespace llvm {
@@ -53,6 +54,24 @@ private:
   std::unique_ptr<AMDGPU::HSAMD::MetadataStreamer> HSAMetadataStream;
 
   MCCodeEmitter *DumpCodeInstEmitter = nullptr;
+
+  struct FuncRsrcEntry {
+    MCSymbol *FuncSym;
+    uint32_t LDSSize;
+    bool IsKernel;
+    int32_t NumVGPR;
+    int32_t NumAGPR;
+    int32_t NumSGPR;
+    uint64_t ScratchSize;
+    bool UsesVCC;
+    bool UsesFlatScratch;
+    bool HasDynSizedStack;
+    bool HasIndirectCall;
+  };
+  SmallVector<FuncRsrcEntry, 32> FuncRsrcEntries;
+
+  // RDC-ISA: LDS offsets emitted as absolute symbols for cross-TU linking.
+  DenseMap<const GlobalValue *, unsigned> LDSSymbolOffsets;
 
   // When appropriate, add a _dvgpr$ symbol.
   void emitDVgprSymbol(MachineFunction &MF);

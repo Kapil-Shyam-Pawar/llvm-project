@@ -3021,6 +3021,9 @@ template <class ELFT> void Writer<ELFT>::writeSections() {
         sec->writeTo<ELFT>(ctx, ctx.bufferStart + sec->offset, tg);
   }
 
+  // Target-specific post-relocation pass.
+  ctx.target->postRelocatePass();
+
   // Finally, check that all dynamic relocation addends were written correctly.
   if (ctx.arg.checkDynamicRelocs && ctx.arg.writeAddends) {
     for (OutputSection *sec : ctx.outputSections)

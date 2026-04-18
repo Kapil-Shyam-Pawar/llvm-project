@@ -1237,6 +1237,12 @@ defm gpu_rdc : BoolFOption<"gpu-rdc",
           "Generate relocatable device code, also known as separate compilation mode">,
   NegFlag<SetFalse>>;
 
+def fgpu_rdc_isa : Flag<["-"], "fgpu-rdc-isa">,
+  Visibility<[ClangOption, CC1Option]>,
+  HelpText<"Generate relocatable device code with ISA at compile time, "
+           "enabling fast device linking without LTO (HIP/AMDGPU only)">,
+  MarshallingInfoFlag<LangOpts<"GPURelocatableDeviceCodeISA">>;
+
 defm offload_implicit_host_device_templates :
   BoolFOption<"offload-implicit-host-device-templates",
   LangOpts<"OffloadImplicitHostDeviceTemplates">, DefaultFalse,

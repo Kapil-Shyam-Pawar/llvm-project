@@ -536,6 +536,83 @@ bool AMDGPUAsmPrinter::doFinalization(Module &M) {
       RI.getMaxSGPRSymbol(OutContext), RI.getMaxNamedBarrierSymbol(OutContext));
   OutStreamer->popSection();
 
+  // Emit .amdgpu.func_rsrc section for cross-TU kernel descriptor patching.
+  if (!FuncRsrcEntries.empty()) {
+    using RIK = MCResourceInfo::ResourceInfoKind;
+
+    OutStreamer->pushSection();
+    MCSectionELF *RsrcSection = OutContext.getELFSection(
+        ".amdgpu.func_rsrc", ELF::SHT_PROGBITS, 0);
+    OutStreamer->switchSection(RsrcSection);
+
+    // Header
+    OutStreamer->emitInt32(1); // version
+    OutStreamer->emitInt32(FuncRsrcEntries.size());
+
+    // Resolve MCExpr if possible, else use per-function fallback value.
+    auto resolveOrFallback = [](const MCExpr *E, int64_t Fallback) -> int64_t {
+      int64_t Val = 0;
+      if (E->evaluateAsAbsolute(Val) && Val != 0)
+        return Val;
+      return Fallback;
+    };
+
+    for (const FuncRsrcEntry &E : FuncRsrcEntries) {
+      StringRef Name = E.FuncSym->getName();
+
+      // func_addr: relocation to the function symbol (R_AMDGPU_ABS64)
+      OutStreamer->emitSymbolValue(E.FuncSym, 8);
+
+      OutStreamer->emitInt32(resolveOrFallback(
+          RI.getSymRefExpr(Name, RIK::RIK_NumVGPR, OutContext), E.NumVGPR));
+      OutStreamer->emitInt32(resolveOrFallback(
+          RI.getSymRefExpr(Name, RIK::RIK_NumAGPR, OutContext), E.NumAGPR));
+      OutStreamer->emitInt32(resolveOrFallback(
+          RI.getSymRefExpr(Name, RIK::RIK_NumSGPR, OutContext), E.NumSGPR));
+      OutStreamer->emitInt32(E.LDSSize);
+      OutStreamer->emitInt32(static_cast<uint32_t>(resolveOrFallback(
+          RI.getSymRefExpr(Name, RIK::RIK_PrivateSegSize, OutContext),
+          E.ScratchSize)));
+
+      int64_t UsesVCC = resolveOrFallback(
+          RI.getSymRefExpr(Name, RIK::RIK_UsesVCC, OutContext), E.UsesVCC);
+      int64_t UsesFlatScratch = resolveOrFallback(
+          RI.getSymRefExpr(Name, RIK::RIK_UsesFlatScratch, OutContext),
+          E.UsesFlatScratch);
+      int64_t HasDynStack = resolveOrFallback(
+          RI.getSymRefExpr(Name, RIK::RIK_HasDynSizedStack, OutContext),
+          E.HasDynSizedStack);
+      int64_t HasIndirect = resolveOrFallback(
+          RI.getSymRefExpr(Name, RIK::RIK_HasIndirectCall, OutContext),
+          E.HasIndirectCall);
+      uint32_t Flags = (UsesVCC & 1) | ((UsesFlatScratch & 1) << 1) |
+                        ((HasDynStack & 1) << 2) | ((HasIndirect & 1) << 3) |
+                        (E.IsKernel ? 16 : 0);
+      OutStreamer->emitInt32(Flags);
+
+      // reserved (padding to 36-byte entry alignment)
+      OutStreamer->emitInt32(0);
+    }
+
+    OutStreamer->popSection();
+    FuncRsrcEntries.clear();
+  }
+
+  // RDC-ISA: emit absolute symbols for LDS globals so the linker can
+  // resolve R_AMDGPU_LDS_OFFSET relocations from other TUs.
+  if (!LDSSymbolOffsets.empty()) {
+    for (auto &[GV, Offset] : LDSSymbolOffsets) {
+      MCSymbol *Sym = getSymbol(GV);
+      Sym->redefineIfPossible();
+      if (!Sym->isDefined() && !Sym->isVariable()) {
+        OutStreamer->emitAssignment(
+            Sym, MCConstantExpr::create(Offset, OutContext));
+        OutStreamer->emitSymbolAttribute(Sym, MCSA_Global);
+      }
+    }
+    LDSSymbolOffsets.clear();
+  }
+
   for (Function &F : M.functions())
     validateMCResourceInfo(F);
 
@@ -698,6 +775,24 @@ bool AMDGPUAsmPrinter::runOnMachineFunction(MachineFunction &MF) {
   }
 
   RI.gatherResourceInfo(MF, *ResourceUsage, OutContext);
+
+  if (AMDGPU::EnableRDCISA && STM.isAmdHsaOS()) {
+    const SIMachineFunctionInfo *SIMfi =
+        MF.getInfo<SIMachineFunctionInfo>();
+    MCSymbol *FnSym = TM.getSymbol(&MF.getFunction());
+    const auto &FRI = *ResourceUsage;
+    FuncRsrcEntries.push_back(
+        {FnSym, SIMfi->getLDSSize(), MFI->isEntryFunction(),
+         FRI.NumVGPR, FRI.NumAGPR, FRI.NumExplicitSGPR,
+         FRI.PrivateSegmentSize, FRI.UsesVCC, FRI.UsesFlatScratch,
+         FRI.HasDynamicallySizedStack, FRI.HasIndirectCall});
+
+    // Collect LDS offsets from entry functions for absolute symbols.
+    if (MFI->isEntryFunction()) {
+      for (auto &[GV, Offset] : MFI->getLocalMemoryObjects())
+        LDSSymbolOffsets.try_emplace(GV, Offset);
+    }
+  }
 
   if (MFI->isModuleEntryFunction()) {
     getSIProgramInfo(CurrentProgramInfo, MF);

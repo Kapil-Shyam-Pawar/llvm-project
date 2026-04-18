@@ -3416,7 +3416,8 @@ class OffloadingActionBuilder final {
 
       CompileDeviceOnly = C.getDriver().offloadDeviceOnly();
       Relocatable = Args.hasFlag(options::OPT_fgpu_rdc,
-                                 options::OPT_fno_gpu_rdc, /*Default=*/false);
+                                 options::OPT_fno_gpu_rdc, /*Default=*/false) ||
+                    Args.hasArg(options::OPT_fgpu_rdc_isa);
     }
 
     ActionBuilderReturnCode addDeviceDependences(Action *HostAction) override {
@@ -4458,7 +4459,8 @@ shouldBundleHIPAsmWithNewDriver(const Compilation &C,
   if (!C.isOffloadingHostKind(Action::OFK_HIP) ||
       !Args.hasArg(options::OPT_S) || Args.hasArg(options::OPT_emit_llvm) ||
       D.offloadDeviceOnly() ||
-      Args.hasFlag(options::OPT_fgpu_rdc, options::OPT_fno_gpu_rdc, false))
+      Args.hasFlag(options::OPT_fgpu_rdc, options::OPT_fno_gpu_rdc, false) ||
+      Args.hasArg(options::OPT_fgpu_rdc_isa))
     return false;
 
   bool HasAMDGCNHIPDevice = false;
@@ -4961,7 +4963,8 @@ Driver::BuildOffloadingActions(Compilation &C, llvm::opt::DerivedArgList &Args,
 
   bool HIPNoRDC =
       C.isOffloadingHostKind(Action::OFK_HIP) &&
-      !Args.hasFlag(options::OPT_fgpu_rdc, options::OPT_fno_gpu_rdc, false);
+      !Args.hasFlag(options::OPT_fgpu_rdc, options::OPT_fno_gpu_rdc, false) &&
+      !Args.hasArg(options::OPT_fgpu_rdc_isa);
 
   bool HIPRelocatableObj =
       C.isOffloadingHostKind(Action::OFK_HIP) &&
@@ -5316,10 +5319,13 @@ Action *Driver::ConstructPhaseAction(
     // Skip a redundant Backend phase for HIP device code when using the new
     // offload driver, where mid-end is done in linker wrapper. With
     // -save-temps, we still need the Backend phase to produce optimized IR.
+    // With -fgpu-rdc-isa, the backend must run so device code is compiled to
+    // ISA at compile time (instead of deferring to LTO at link time).
     if (TargetDeviceOffloadKind == Action::OFK_HIP &&
         Args.hasFlag(options::OPT_offload_new_driver,
                      options::OPT_no_offload_new_driver,
                      C.getActiveOffloadKinds() != Action::OFK_None) &&
+        !Args.hasArg(options::OPT_fgpu_rdc_isa) &&
         !offloadDeviceOnly() && !isSaveTempsEnabled() &&
         !(Args.hasArg(options::OPT_S) && !Args.hasArg(options::OPT_emit_llvm)))
       return Input;
@@ -5353,7 +5359,9 @@ Action *Driver::ConstructPhaseAction(
         TargetDeviceOffloadKind == Action::OFK_HIP && OffloadingToolChain &&
         OffloadingToolChain->getTriple().isSPIRV() && UseSPIRVBackend &&
         offloadDeviceOnly() &&
-        !Args.hasFlag(options::OPT_fgpu_rdc, options::OPT_fno_gpu_rdc, false);
+        !Args.hasFlag(options::OPT_fgpu_rdc, options::OPT_fno_gpu_rdc,
+                      false) &&
+        !Args.hasArg(options::OPT_fgpu_rdc_isa);
 
     auto &DefaultToolChain = C.getDefaultToolChain();
     auto DefaultToolChainTriple = DefaultToolChain.getTriple();
@@ -5366,26 +5374,31 @@ Action *Driver::ConstructPhaseAction(
         DefaultToolChainTriple.getVendor() == llvm::Triple::VendorType::AMD &&
         !(Args.hasArg(options::OPT_S) && !Args.hasArg(options::OPT_emit_llvm));
 
+    // -fgpu-rdc-isa: device compilation produces ISA at compile time, so
+    // skip the BC emission path — let the backend run to assembly/object.
+    bool IsGPURDCISA = Args.hasArg(options::OPT_fgpu_rdc_isa);
+
     if (Args.hasArg(options::OPT_emit_llvm) ||
         EmitBitcodeForNonOffloadAMDSPIRV ||
         TargetDeviceOffloadKind == Action::OFK_SYCL ||
-        (((Input->getOffloadingToolChain() &&
-           Input->getOffloadingToolChain()->getTriple().isAMDGPU() &&
-           TargetDeviceOffloadKind != Action::OFK_None) ||
-          TargetDeviceOffloadKind == Action::OFK_HIP) &&
-         !UseSPIRVBackendForHipDeviceOnlyNoRDC &&
-         ((Args.hasFlag(options::OPT_fgpu_rdc, options::OPT_fno_gpu_rdc,
-                        false) ||
-           (Args.hasFlag(options::OPT_offload_new_driver,
-                         options::OPT_no_offload_new_driver,
-                         C.getActiveOffloadKinds() != Action::OFK_None) &&
-            !(Args.hasArg(options::OPT_S) &&
-              !Args.hasArg(options::OPT_emit_llvm)) &&
-            (!offloadDeviceOnly() ||
-             (Input->getOffloadingToolChain() &&
-              TargetDeviceOffloadKind == Action::OFK_HIP &&
-              Input->getOffloadingToolChain()->getTriple().isSPIRV())))) ||
-          TargetDeviceOffloadKind == Action::OFK_OpenMP))) {
+        (!IsGPURDCISA &&
+         (((Input->getOffloadingToolChain() &&
+            Input->getOffloadingToolChain()->getTriple().isAMDGPU() &&
+            TargetDeviceOffloadKind != Action::OFK_None) ||
+           TargetDeviceOffloadKind == Action::OFK_HIP) &&
+          !UseSPIRVBackendForHipDeviceOnlyNoRDC &&
+          ((Args.hasFlag(options::OPT_fgpu_rdc, options::OPT_fno_gpu_rdc,
+                         false) ||
+            (Args.hasFlag(options::OPT_offload_new_driver,
+                          options::OPT_no_offload_new_driver,
+                          C.getActiveOffloadKinds() != Action::OFK_None) &&
+             !(Args.hasArg(options::OPT_S) &&
+               !Args.hasArg(options::OPT_emit_llvm)) &&
+             (!offloadDeviceOnly() ||
+              (Input->getOffloadingToolChain() &&
+               TargetDeviceOffloadKind == Action::OFK_HIP &&
+               Input->getOffloadingToolChain()->getTriple().isSPIRV())))) ||
+           TargetDeviceOffloadKind == Action::OFK_OpenMP)))) {
       types::ID Output =
           Args.hasArg(options::OPT_S) &&
                   (TargetDeviceOffloadKind == Action::OFK_None ||
@@ -6640,7 +6653,8 @@ const char *Driver::GetNamedOutputPath(Compilation &C, const JobAction &JA,
       // unit.
       bool IsHIPNoRDC = JA.getOffloadingDeviceKind() == Action::OFK_HIP &&
                         !C.getArgs().hasFlag(options::OPT_fgpu_rdc,
-                                             options::OPT_fno_gpu_rdc, false);
+                                             options::OPT_fno_gpu_rdc, false) &&
+                        !C.getArgs().hasArg(options::OPT_fgpu_rdc_isa);
       bool UseOutExtension = IsHIPNoRDC || isa<OffloadPackagerJobAction>(JA);
       if (UseOutExtension) {
         Output = BaseName;
