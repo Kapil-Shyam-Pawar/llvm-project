@@ -255,6 +255,8 @@ public:
     MO_ABS32_LO = 9,
     MO_ABS32_HI = 10,
     MO_ABS64 = 11,
+    // MO_LDS_OFFSET -> symbol@lds_offset -> R_AMDGPU_LDS_OFFSET.
+    MO_LDS_OFFSET = 12,
   };
 
   explicit SIInstrInfo(const GCNSubtarget &ST);

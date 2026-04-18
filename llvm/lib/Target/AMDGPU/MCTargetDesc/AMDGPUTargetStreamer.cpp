@@ -945,6 +945,63 @@ bool AMDGPUTargetELFStreamer::EmitISAVersion() {
   return true;
 }
 
+// Widen MsgPack resource fields to uint32 so the linker can patch in place.
+static void widenMetadataFieldsToUInt32(std::string &Blob) {
+  const llvm::StringRef Fields[] = {
+      ".private_segment_fixed_size", ".group_segment_fixed_size",
+      ".vgpr_count", ".sgpr_count", ".agpr_count",
+  };
+
+  for (llvm::StringRef Key : Fields) {
+    uint8_t Hdr = 0xa0 | static_cast<uint8_t>(Key.size());
+    size_t Pos = 0;
+    for (;;) {
+      size_t Found = std::string::npos;
+      for (size_t I = Pos; I + 1 + Key.size() < Blob.size(); ++I) {
+        if (static_cast<uint8_t>(Blob[I]) == Hdr &&
+            memcmp(Blob.data() + I + 1, Key.data(), Key.size()) == 0) {
+          Found = I;
+          break;
+        }
+      }
+      if (Found == std::string::npos)
+        break;
+
+      size_t ValOff = Found + 1 + Key.size();
+      uint8_t First = static_cast<uint8_t>(Blob[ValOff]);
+      uint64_t Val;
+      size_t OldSz;
+
+      if (First <= 0x7f) {
+        Val = First;
+        OldSz = 1;
+      } else if (First == 0xcc && ValOff + 2 <= Blob.size()) {
+        Val = static_cast<uint8_t>(Blob[ValOff + 1]);
+        OldSz = 2;
+      } else if (First == 0xcd && ValOff + 3 <= Blob.size()) {
+        Val = (static_cast<uint64_t>(static_cast<uint8_t>(Blob[ValOff + 1]))
+               << 8) |
+              static_cast<uint8_t>(Blob[ValOff + 2]);
+        OldSz = 3;
+      } else if (First == 0xce) {
+        Pos = ValOff + 5;
+        continue;
+      } else {
+        Pos = ValOff + 1;
+        continue;
+      }
+
+      char U32[5] = {static_cast<char>(0xce),
+                     static_cast<char>((Val >> 24) & 0xff),
+                     static_cast<char>((Val >> 16) & 0xff),
+                     static_cast<char>((Val >> 8) & 0xff),
+                     static_cast<char>(Val & 0xff)};
+      Blob.replace(ValOff, OldSz, U32, 5);
+      Pos = ValOff + 5;
+    }
+  }
+}
+
 bool AMDGPUTargetELFStreamer::EmitHSAMetadata(msgpack::Document &HSAMetadataDoc,
                                               bool Strict) {
   HSAMD::V3::MetadataVerifier Verifier(Strict);
@@ -953,6 +1010,9 @@ bool AMDGPUTargetELFStreamer::EmitHSAMetadata(msgpack::Document &HSAMetadataDoc,
 
   std::string HSAMetadataString;
   HSAMetadataDoc.writeToBlob(HSAMetadataString);
+
+  if (AMDGPU::EnableRDCISA)
+    widenMetadataFieldsToUInt32(HSAMetadataString);
 
   // Create two labels to mark the beginning and end of the desc field
   // and a MCExpr to calculate the size of the desc field.

@@ -807,6 +807,7 @@ uint64_t InputSectionBase::getRelocTargetVA(Ctx &ctx, const Relocation &r,
   case R_DTPREL:
   case R_RELAX_GOT_PC_NOPIC:
   case RE_AARCH64_AUTH:
+  case RE_AMDGPU_LDS:
   case RE_RISCV_ADD:
   case RE_RISCV_LEB128:
     return r.sym->getVA(ctx, a);

@@ -44,6 +44,12 @@ class raw_ostream;
 
 namespace AMDGPU {
 
+// -fgpu-rdc-isa mode flag. Defined in AMDGPUBaseInfo.cpp, set by cl::opt
+// in AMDGPUTargetMachine.cpp. Declared here so both codegen and MC layers
+// can access it without layering violations.
+extern bool EnableRDCISA;
+
+
 struct AMDGPUMCKernelCodeT;
 struct IsaVersion;
 

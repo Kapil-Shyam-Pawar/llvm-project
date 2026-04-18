@@ -65,48 +65,54 @@ void AMDGCN::Linker::constructLldCommand(Compilation &C, const JobAction &JA,
                         "-m",
                         "elf64_amdgpu",
                         "--no-undefined",
-                        "-shared",
-                        "-plugin-opt=-amdgpu-internalize-symbols"};
-  if (Args.hasArg(options::OPT_hipstdpar))
-    LldArgs.push_back("-plugin-opt=-amdgpu-enable-hipstdpar");
+                        "-shared"};
 
   auto &TC = getToolChain();
   auto &D = TC.getDriver();
-  bool IsThinLTO = D.getOffloadLTOMode() == LTOK_Thin;
-  addLTOOptions(TC, Args, LldArgs, Output, Inputs, IsThinLTO);
+  bool IsGPURDCISA = Args.hasArg(options::OPT_fgpu_rdc_isa);
 
-  // Extract all the -m options
-  std::vector<llvm::StringRef> Features;
-  amdgpu::getAMDGPUTargetFeatures(D, TC.getTriple(), Args, Features);
+  // -fgpu-rdc-isa inputs are ISA objects — skip LTO and plugin-opt flags.
+  if (!IsGPURDCISA) {
+    LldArgs.push_back("-plugin-opt=-amdgpu-internalize-symbols");
+    if (Args.hasArg(options::OPT_hipstdpar))
+      LldArgs.push_back("-plugin-opt=-amdgpu-enable-hipstdpar");
 
-  // Add features to mattr such as cumode
-  std::string MAttrString = "-plugin-opt=-mattr=";
-  for (auto OneFeature : unifyTargetFeatures(Features)) {
-    MAttrString.append(Args.MakeArgString(OneFeature));
-    if (OneFeature != Features.back())
-      MAttrString.append(",");
-  }
-  if (!Features.empty())
-    LldArgs.push_back(Args.MakeArgString(MAttrString));
+    bool IsThinLTO = D.getOffloadLTOMode() == LTOK_Thin;
+    addLTOOptions(TC, Args, LldArgs, Output, Inputs, IsThinLTO);
 
-  // ToDo: Remove this option after AMDGPU backend supports ISA-level linking.
-  // Since AMDGPU backend currently does not support ISA-level linking, all
-  // called functions need to be imported.
-  if (IsThinLTO) {
-    LldArgs.push_back(Args.MakeArgString("-plugin-opt=-force-import-all"));
-    LldArgs.push_back(Args.MakeArgString("-plugin-opt=-avail-extern-to-local"));
-    LldArgs.push_back(Args.MakeArgString(
-        "-plugin-opt=-avail-extern-gv-in-addrspace-to-local=3"));
-  }
+    // Extract all the -m options
+    std::vector<llvm::StringRef> Features;
+    amdgpu::getAMDGPUTargetFeatures(D, TC.getTriple(), Args, Features);
 
-  if (Arg *A = Args.getLastArgNoClaim(options::OPT_g_Group))
-    if (!A->getOption().matches(options::OPT_g0) &&
-        !A->getOption().matches(options::OPT_ggdb0))
-      LldArgs.push_back("-plugin-opt=-amdgpu-spill-cfi-saved-regs");
+    // Add features to mattr such as cumode
+    std::string MAttrString = "-plugin-opt=-mattr=";
+    for (auto OneFeature : unifyTargetFeatures(Features)) {
+      MAttrString.append(Args.MakeArgString(OneFeature));
+      if (OneFeature != Features.back())
+        MAttrString.append(",");
+    }
+    if (!Features.empty())
+      LldArgs.push_back(Args.MakeArgString(MAttrString));
 
-  for (const Arg *A : Args.filtered(options::OPT_mllvm)) {
-    LldArgs.push_back(
-        Args.MakeArgString(Twine("-plugin-opt=") + A->getValue(0)));
+    // ToDo: Remove this option after AMDGPU backend supports ISA-level linking.
+    // Since AMDGPU backend currently does not support ISA-level linking, all
+    // called functions need to be imported.
+    if (IsThinLTO) {
+      LldArgs.push_back(Args.MakeArgString("-plugin-opt=-force-import-all"));
+      LldArgs.push_back(Args.MakeArgString("-plugin-opt=-avail-extern-to-local"));
+      LldArgs.push_back(Args.MakeArgString(
+          "-plugin-opt=-avail-extern-gv-in-addrspace-to-local=3"));
+    }
+
+    if (Arg *A = Args.getLastArgNoClaim(options::OPT_g_Group))
+      if (!A->getOption().matches(options::OPT_g0) &&
+          !A->getOption().matches(options::OPT_ggdb0))
+        LldArgs.push_back("-plugin-opt=-amdgpu-spill-cfi-saved-regs");
+
+    for (const Arg *A : Args.filtered(options::OPT_mllvm)) {
+      LldArgs.push_back(
+          Args.MakeArgString(Twine("-plugin-opt=") + A->getValue(0)));
+    }
   }
 
   if (C.getDriver().isSaveTempsEnabled())
@@ -258,11 +264,20 @@ void HIPAMDToolChain::addClangTargetOptions(
 
   CC1Args.append({"-fcuda-is-device", "-fno-threadsafe-statics"});
 
-  if (!DriverArgs.hasFlag(options::OPT_fgpu_rdc, options::OPT_fno_gpu_rdc,
-                          false)) {
+  bool IsRDC = DriverArgs.hasFlag(options::OPT_fgpu_rdc,
+                                  options::OPT_fno_gpu_rdc, false);
+  bool IsRDCISA = DriverArgs.hasArg(options::OPT_fgpu_rdc_isa);
+
+  if (!IsRDC && !IsRDCISA) {
     CC1Args.append({"-mllvm", "-amdgpu-internalize-symbols"});
     if (DriverArgs.hasArgNoClaim(options::OPT_hipstdpar))
       CC1Args.append({"-mllvm", "-amdgpu-enable-hipstdpar"});
+  }
+
+  if (IsRDCISA) {
+    CC1Args.append({"-mllvm", "-amdgpu-rdc-isa"});
+    // LowerModuleLDS destroys symbol names needed for cross-TU LDS linking.
+    CC1Args.append({"-mllvm", "-amdgpu-enable-lower-module-lds=0"});
   }
 
   StringRef MaxThreadsPerBlock =

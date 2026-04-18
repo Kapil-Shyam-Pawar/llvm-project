@@ -68,6 +68,8 @@ static AMDGPUMCExpr::Specifier getSpecifier(unsigned MOFlags) {
     return AMDGPUMCExpr::S_ABS32_HI;
   case SIInstrInfo::MO_ABS64:
     return AMDGPUMCExpr::S_ABS64;
+  case SIInstrInfo::MO_LDS_OFFSET:
+    return AMDGPUMCExpr::S_LDS_OFFSET;
   }
 }
 

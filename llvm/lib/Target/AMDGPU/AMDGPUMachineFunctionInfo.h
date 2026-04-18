@@ -109,6 +109,11 @@ public:
   unsigned allocateLDSGlobal(const DataLayout &DL, const GlobalVariable &GV,
                              Align Trailing);
 
+  const SmallDenseMap<const GlobalValue *, unsigned, 4> &
+  getLocalMemoryObjects() const {
+    return LocalMemoryObjects;
+  }
+
   static std::optional<uint32_t> getLDSKernelIdMetadata(const Function &F);
   static std::optional<uint32_t> getLDSAbsoluteAddress(const GlobalValue &GV);
 

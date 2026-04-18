@@ -26,6 +26,7 @@ const MCAsmInfo::AtSpecifier atSpecifiers[] = {
     {AMDGPUMCExpr::S_ABS32_LO, "abs32@lo"},
     {AMDGPUMCExpr::S_ABS32_HI, "abs32@hi"},
     {AMDGPUMCExpr::S_ABS64, "abs64"},
+    {AMDGPUMCExpr::S_LDS_OFFSET, "lds_offset"},
 };
 
 AMDGPUMCAsmInfo::AMDGPUMCAsmInfo(const Triple &TT,

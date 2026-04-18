@@ -113,6 +113,9 @@ public:
   virtual void relocateAlloc(InputSection &sec, uint8_t *buf) const;
   void relocateEh(EhInputSection &sec, uint8_t *buf) const;
 
+  // Post-relocation pass for target-specific fixups.
+  virtual void postRelocatePass() const {}
+
   // Do a linker relaxation pass and return true if we changed something.
   virtual bool relaxOnce(int pass) const { return false; }
   virtual bool synthesizeAlign(uint64_t &dot, InputSection *sec) {

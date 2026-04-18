@@ -541,9 +541,20 @@ Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args,
     Triple.isAMDGPU() ? CmdArgs.push_back(Args.MakeArgString("-mcpu=" + Arch))
                       : CmdArgs.push_back(Args.MakeArgString("-march=" + Arch));
 
-  // AMDGPU is always in LTO mode currently.
-  if (Triple.isAMDGPU())
-    CmdArgs.push_back("-flto");
+  // Only enable LTO for AMDGPU when inputs contain bitcode.
+  if (Triple.isAMDGPU()) {
+    bool HasBitcodeInput = false;
+    for (StringRef InputFile : InputFiles) {
+      auto MBOrErr = MemoryBuffer::getFile(InputFile);
+      if (MBOrErr &&
+          identify_magic((*MBOrErr)->getBuffer()) == file_magic::bitcode) {
+        HasBitcodeInput = true;
+        break;
+      }
+    }
+    if (HasBitcodeInput)
+      CmdArgs.push_back("-flto");
+  }
 
   // Forward all of the `--offload-opt` and `-mllvm` options to the device.
   for (auto &Arg : Args.filtered(OPT_offload_opt_eq_minus, OPT_mllvm))
