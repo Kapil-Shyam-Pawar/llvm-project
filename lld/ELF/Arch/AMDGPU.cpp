@@ -405,12 +405,8 @@ static unsigned getVGPREncodingGranule(uint32_t mach, bool isWave32) {
   }
 }
 
-// Kernel descriptor patching for -fgpu-rdc-isa.
-//
-// When device code is compiled with -fgpu-rdc-isa, each TU produces ISA with
-// locally-computed resource usage in the kernel descriptor. After linking, the
-// kernel descriptor must be updated with the final values that account for the
-// full call graph (cross-TU callees).
+// -fgpu-rdc-isa: patch each kernel descriptor with link-time aggregated
+// resource usage (cross-TU callees), replacing per-TU values from each object.
 void AMDGPU::postRelocatePass() const {
   using namespace llvm::amdhsa;
 
@@ -513,6 +509,7 @@ void AMDGPU::postRelocatePass() const {
       }
     }
   }
+
   // Step 3: Collect kernel descriptors.
   struct KDInfo {
     Defined *sym;
@@ -611,6 +608,15 @@ void AMDGPU::postRelocatePass() const {
     uint32_t ts = computeTotalScratch(va);
     globalMaxTotalScratch = std::max(globalMaxTotalScratch, ts);
   }
+
+  // Aggregate summary
+  Msg(ctx) << "[amdgpu-rdc-isa] Aggregated " << funcRsrcMap.size()
+           << " resources: VGPR=" << globalMax.numVGPRs
+           << ", AGPR=" << globalMax.numAGPRs
+           << ", SGPR=" << globalMax.numSGPRs
+           << ", scratch=" << globalMaxTotalScratch
+           << ", LDS=" << globalMax.ldsSize
+           << ", kernels=" << kernelDescriptors.size();
 
   // Step 4: For each kernel, walk the call graph to compute cross-TU
   // resource aggregates, then patch the kernel descriptor.
@@ -725,11 +731,25 @@ void AMDGPU::postRelocatePass() const {
       }
     }
 
-    // Clear USES_DYNAMIC_STACK if no reachable function uses alloca.
-    if (!hasDynSizedStack) {
-      if (AMDHSA_BITS_GET(kcProps, KERNEL_CODE_PROPERTY_USES_DYNAMIC_STACK)) {
-        AMDHSA_BITS_SET(kcProps, KERNEL_CODE_PROPERTY_USES_DYNAMIC_STACK, 0);
+    // Sync USES_DYNAMIC_STACK with the aggregated call tree (indirect callees
+    // may use dynamic stack even when the dispatcher KD body does not).
+    {
+      uint16_t wantBit = hasDynSizedStack ? 1u : 0u;
+      if (AMDHSA_BITS_GET(kcProps, KERNEL_CODE_PROPERTY_USES_DYNAMIC_STACK) !=
+          wantBit) {
+        AMDHSA_BITS_SET(kcProps, KERNEL_CODE_PROPERTY_USES_DYNAMIC_STACK,
+                        wantBit);
         write16le(kd.buf + KERNEL_CODE_PROPERTIES_OFFSET, kcProps);
+      }
+    }
+
+    // Enable private-segment (scratch) in rsrc2 when any aggregated callee
+    // needs scratch, even if the dispatcher KD body itself does not.
+    if (maxScratch > 0) {
+      uint32_t rsrc2 = read32le(kd.buf + COMPUTE_PGM_RSRC2_OFFSET);
+      if (!AMDHSA_BITS_GET(rsrc2, COMPUTE_PGM_RSRC2_ENABLE_PRIVATE_SEGMENT)) {
+        AMDHSA_BITS_SET(rsrc2, COMPUTE_PGM_RSRC2_ENABLE_PRIVATE_SEGMENT, 1);
+        write32le(kd.buf + COMPUTE_PGM_RSRC2_OFFSET, rsrc2);
       }
     }
 

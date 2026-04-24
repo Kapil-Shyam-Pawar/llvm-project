@@ -67,6 +67,12 @@ recursivelyVisitUsers(GlobalValue &GV,
     if (Instruction *I = dyn_cast<Instruction>(U)) {
       Function *F = I->getFunction();
       if (!AMDGPU::isEntryFunctionCC(F->getCallingConv())) {
+        // -fgpu-rdc-isa: ld.lld handles cross-TU LDS, so respect explicit noinline.
+        if (AMDGPU::EnableRDCISA && F->hasFnAttribute(Attribute::NoInline)) {
+          Stack.push_back(F);
+          continue;
+        }
+
         // FIXME: This is a horrible hack. We should always respect noinline,
         // and just let us hit the error when we can't handle this.
         //

@@ -198,6 +198,20 @@ public:
     return {ST.getMinFlatWorkGroupSize(), ST.getMaxFlatWorkGroupSize()};
   }
 
+  unsigned getWavefrontSize(const Function &F) {
+    const GCNSubtarget &ST = TM.getSubtarget<GCNSubtarget>(F);
+    return ST.getWavefrontSize();
+  }
+
+  // Largest flat-work-group-size for which getWavesPerEUForWorkGroup == 1,
+  // i.e. wavefrontSize * EUsPerCU. Using this as FWGS.second keeps
+  // getEffectiveWavesPerEU()'s Default.first at 1, so a requested
+  // waves-per-eu of (1,1) is not clamped upward.
+  unsigned getMaxFWGSForSingleWavePerEU(const Function &F) {
+    const GCNSubtarget &ST = TM.getSubtarget<GCNSubtarget>(F);
+    return ST.getWavefrontSize() * ST.getEUsPerCU();
+  }
+
   SmallVector<unsigned> getMaxNumWorkGroups(const Function &F) {
     const GCNSubtarget &ST = TM.getSubtarget<GCNSubtarget>(F);
     return ST.getMaxNumWorkGroups(F);
@@ -922,7 +936,41 @@ struct AAAMDFlatWorkGroupSize : public AAAMDSizeRangeAttribute {
   }
 
   ChangeStatus updateImpl(Attributor &A) override {
-    return updateImplImpl<AAAMDFlatWorkGroupSize>(A);
+    if (!AMDGPU::EnableRDCISA)
+      return updateImplImpl<AAAMDFlatWorkGroupSize>(A);
+
+    // -fgpu-rdc-isa: callers live in other TUs; on unknown callers emit a
+    // conservative wg-size range so waves-per-eu=(1,1) is honored.
+    ChangeStatus Change = ChangeStatus::UNCHANGED;
+
+    auto CheckCallSite = [&](AbstractCallSite CS) {
+      Function *Caller = CS.getInstruction()->getFunction();
+      const auto *CallerInfo = A.getAAFor<AAAMDFlatWorkGroupSize>(
+          *this, IRPosition::function(*Caller), DepClassTy::REQUIRED);
+      if (!CallerInfo || !CallerInfo->isValidState())
+        return false;
+
+      Change |=
+          clampStateAndIndicateChange(this->getState(), CallerInfo->getState());
+
+      return true;
+    };
+
+    bool AllCallSitesKnown = true;
+    if (!A.checkForAllCallSites(CheckCallSite, *this,
+                                /*RequireAllCallSites=*/true,
+                                AllCallSitesKnown)) {
+      auto &InfoCache =
+          static_cast<AMDGPUInformationCache &>(A.getInfoCache());
+      unsigned MaxWG =
+          InfoCache.getMaxFWGSForSingleWavePerEU(*getAssociatedFunction());
+      ConstantRange CR(APInt(32, 1), APInt(32, MaxWG + 1));
+      IntegerRangeState IRS(CR);
+      this->getState() = IRS;
+      return indicateOptimisticFixpoint();
+    }
+
+    return Change;
   }
 
   /// Create an abstract attribute view for the position \p IRP.
@@ -1159,8 +1207,18 @@ struct AAAMDWavesPerEU : public AAAMDSizeRangeAttribute {
     };
 
     bool AllCallSitesKnown = true;
-    if (!A.checkForAllCallSites(CheckCallSite, *this, true, AllCallSitesKnown))
+    if (!A.checkForAllCallSites(CheckCallSite, *this, true,
+                                AllCallSitesKnown)) {
+      // -fgpu-rdc-isa: pin waves-per-eu=(1,1) on unknown callers to reserve
+      // the widest VGPR budget (matches __launch_bounds__(N, 1)).
+      if (AMDGPU::EnableRDCISA) {
+        ConstantRange CR(APInt(32, 1), APInt(32, 2));
+        IntegerRangeState IRS(CR);
+        this->getState() = IRS;
+        return indicateOptimisticFixpoint();
+      }
       return indicatePessimisticFixpoint();
+    }
 
     return Change;
   }
