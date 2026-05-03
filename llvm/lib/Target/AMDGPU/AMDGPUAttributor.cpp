@@ -198,6 +198,14 @@ public:
     return {ST.getMinFlatWorkGroupSize(), ST.getMaxFlatWorkGroupSize()};
   }
 
+  // Largest flat-work-group-size whose default waves-per-EU lower bound is 1
+  // (i.e. wavefrontSize * EUsPerCU). Used as a permissive fallback when
+  // call-site information is unavailable.
+  unsigned getMaxFWGSForSingleWavePerEU(const Function &F) {
+    const GCNSubtarget &ST = TM.getSubtarget<GCNSubtarget>(F);
+    return ST.getWavefrontSize() * ST.getEUsPerCU();
+  }
+
   SmallVector<unsigned> getMaxNumWorkGroups(const Function &F) {
     const GCNSubtarget &ST = TM.getSubtarget<GCNSubtarget>(F);
     return ST.getMaxNumWorkGroups(F);
@@ -922,7 +930,40 @@ struct AAAMDFlatWorkGroupSize : public AAAMDSizeRangeAttribute {
   }
 
   ChangeStatus updateImpl(Attributor &A) override {
-    return updateImplImpl<AAAMDFlatWorkGroupSize>(A);
+    if (!AMDGPU::EnableRDCISA)
+      return updateImplImpl<AAAMDFlatWorkGroupSize>(A);
+
+    // Under per-TU object linking, callers may live in other TUs and the
+    // default upper bound (1024) would force a conservative waves-per-EU
+    // lower bound that inflates register pressure. When call-site info is
+    // not fully known, fall back to a permissive range that keeps the
+    // derived waves-per-EU lower bound at 1.
+    ChangeStatus Change = ChangeStatus::UNCHANGED;
+    auto CheckCallSite = [&](AbstractCallSite CS) {
+      Function *Caller = CS.getInstruction()->getFunction();
+      const auto *CallerInfo = A.getAAFor<AAAMDFlatWorkGroupSize>(
+          *this, IRPosition::function(*Caller), DepClassTy::REQUIRED);
+      if (!CallerInfo || !CallerInfo->isValidState())
+        return false;
+      Change |=
+          clampStateAndIndicateChange(this->getState(), CallerInfo->getState());
+      return true;
+    };
+
+    bool AllCallSitesKnown = true;
+    if (!A.checkForAllCallSites(CheckCallSite, *this,
+                                /*RequireAllCallSites=*/true,
+                                AllCallSitesKnown)) {
+      auto &InfoCache =
+          static_cast<AMDGPUInformationCache &>(A.getInfoCache());
+      unsigned MaxWG =
+          InfoCache.getMaxFWGSForSingleWavePerEU(*getAssociatedFunction());
+      ConstantRange CR(APInt(32, 1), APInt(32, MaxWG + 1));
+      IntegerRangeState IRS(CR);
+      this->getState() = IRS;
+      return indicateOptimisticFixpoint();
+    }
+    return Change;
   }
 
   /// Create an abstract attribute view for the position \p IRP.

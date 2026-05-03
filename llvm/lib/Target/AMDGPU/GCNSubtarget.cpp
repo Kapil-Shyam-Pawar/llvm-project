@@ -135,12 +135,19 @@ GCNSubtarget &GCNSubtarget::initializeSubtargetDependencies(const Triple &TT,
     UseFlatForGlobal = false;
   }
 
-  // Hack to enable gfx1250 A0/B0 codegen. Remove when A0 is decomissioned.
-  if ((EnableGFX1250B0Specific && !hasFeature(AMDGPU::FeatureGFX1250B0)) ||
-      (!EnableGFX1250B0Specific && hasFeature(AMDGPU::FeatureGFX1250B0))) {
-    ToggleFeature(AMDGPU::FeatureGFX1250B0);
+  // Hack to enable gfx1250 A0/B0 codegen. Only toggle on subtargets that
+  // actually have gfx1250 instructions; otherwise unrelated targets would
+  // emit a bogus ".gfx1250_revision" metadata attribute. Remove when A0 is
+  // decomissioned.
+  if (HasGFX1250Insts) {
+    if ((EnableGFX1250B0Specific && !hasFeature(AMDGPU::FeatureGFX1250B0)) ||
+        (!EnableGFX1250B0Specific && hasFeature(AMDGPU::FeatureGFX1250B0))) {
+      ToggleFeature(AMDGPU::FeatureGFX1250B0);
+    }
+    HasGFX1250B0 = hasFeature(AMDGPU::FeatureGFX1250B0);
+  } else {
+    HasGFX1250B0 = false;
   }
-  HasGFX1250B0 = hasFeature(AMDGPU::FeatureGFX1250B0);
 
   // Set defaults if needed.
   if (MaxPrivateElementSize == 0)

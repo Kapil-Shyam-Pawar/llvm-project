@@ -300,6 +300,24 @@ class AMDGPULowerModuleLDS {
         Decl, {}, {OperandBundleDefT<Value *>("ExplicitUse", UseInstance)});
   }
 
+  // Convert remaining defining LDS globals to external declarations so that
+  // codegen emits only declarations and the linker assigns final offsets.
+  static bool externalizeRemainingLocalLDS(Module &M) {
+    bool Changed = false;
+    for (GlobalVariable &GV : M.globals()) {
+      if (GV.getAddressSpace() != AMDGPUAS::LOCAL_ADDRESS)
+        continue;
+      if (GV.isDeclaration())
+        continue;
+      if (AMDGPU::isNamedBarrier(GV))
+        continue;
+      GV.setInitializer(nullptr);
+      GV.setLinkage(GlobalValue::ExternalLinkage);
+      Changed = true;
+    }
+    return Changed;
+  }
+
 public:
   AMDGPULowerModuleLDS(const AMDGPUTargetMachine &TM_) : TM(TM_) {}
 
@@ -924,8 +942,14 @@ public:
     FunctionVariableMap KernelLDSUses, FunctionLDSUses;
     getUsesOfLDSByFunction(CG, M, KernelLDSUses, FunctionLDSUses);
 
-    if (KernelLDSUses.empty() && FunctionLDSUses.empty())
+    // No LDS uses in this TU: under RDC-ISA, remaining defining LDS globals
+    // (e.g. emitted from headers but unused locally) must still be
+    // externalized so the linker can resolve them across TUs.
+    if (KernelLDSUses.empty() && FunctionLDSUses.empty()) {
+      if (AMDGPU::EnableRDCISA)
+        Changed |= externalizeRemainingLocalLDS(M);
       return Changed;
+    }
 
     std::string ModuleId = getUniqueModuleId(&M);
     assert(!ModuleId.empty() &&
@@ -1039,6 +1063,11 @@ public:
       V->setInitializer(nullptr);
       V->setLinkage(GlobalValue::ExternalLinkage);
     }
+
+    // Externalize any remaining defining LDS globals so the linker resolves
+    // them across TUs.
+    if (AMDGPU::EnableRDCISA)
+      externalizeRemainingLocalLDS(M);
 
     // Emit amdgpu.lds.uses metadata for struct and global-scope LDS.
     {

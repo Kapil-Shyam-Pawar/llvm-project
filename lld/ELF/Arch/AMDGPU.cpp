@@ -405,12 +405,8 @@ static unsigned getVGPREncodingGranule(uint32_t mach, bool isWave32) {
   }
 }
 
-// Kernel descriptor patching for -fgpu-rdc-isa.
-//
-// When device code is compiled with -fgpu-rdc-isa, each TU produces ISA with
-// locally-computed resource usage in the kernel descriptor. After linking, the
-// kernel descriptor must be updated with the final values that account for the
-// full call graph (cross-TU callees).
+// -fgpu-rdc-isa: patch each kernel descriptor with link-time aggregated
+// resource usage (cross-TU callees), replacing per-TU values from each object.
 void AMDGPU::postRelocatePass() const {
   using namespace llvm::amdhsa;
 
@@ -513,6 +509,7 @@ void AMDGPU::postRelocatePass() const {
       }
     }
   }
+
   // Step 3: Collect kernel descriptors.
   struct KDInfo {
     Defined *sym;
@@ -560,10 +557,15 @@ void AMDGPU::postRelocatePass() const {
   if (!ctx.objectFiles.empty())
     mach = getEFlags(ctx.objectFiles[0]) & EF_AMDGPU_MACH;
 
-  // Compute per-function max registers/LDS (these are instantaneous maxima).
+  // Global max registers/LDS over device functions only. Kernel entries
+  // already account for their own call tree, so including them in the
+  // indirect-call fallback used below would double-count and reduce
+  // occupancy.
   FuncRsrc globalMax = {0, 0, 0, 0, 0, 0};
   bool globalHasDynStack = false;
   for (auto &[va, rsrc] : funcRsrcMap) {
+    if (rsrc.flags & (1 << 4)) // IsKernel
+      continue;
     globalMax.numVGPRs = std::max(globalMax.numVGPRs, rsrc.numVGPRs);
     globalMax.numAGPRs = std::max(globalMax.numAGPRs, rsrc.numAGPRs);
     globalMax.numSGPRs = std::max(globalMax.numSGPRs, rsrc.numSGPRs);
@@ -610,6 +612,35 @@ void AMDGPU::postRelocatePass() const {
   for (auto &[va, rsrc] : funcRsrcMap) {
     uint32_t ts = computeTotalScratch(va);
     globalMaxTotalScratch = std::max(globalMaxTotalScratch, ts);
+  }
+
+  // Diagnostic summary of the aggregated resource usage that will be patched
+  // into the kernel descriptors. Skipped when there is nothing to patch.
+  if (!funcRsrcMap.empty()) {
+    size_t devfuncCount = 0;
+    for (auto &[va, rsrc] : funcRsrcMap)
+      if (!(rsrc.flags & (1 << 4)))
+        ++devfuncCount;
+
+    uint32_t archVGPR = globalMax.numVGPRs;
+    uint32_t agpr = globalMax.numAGPRs;
+    uint32_t accumOffset = llvm::alignTo(archVGPR, 4u);
+    uint32_t totalVGPR = getTotalNumVGPRs(mach, archVGPR, agpr);
+    uint32_t nextFreeVGPR =
+        hasUnifiedVGPRFile(mach) ? std::max(totalVGPR, accumOffset + agpr)
+                                 : totalVGPR;
+
+    Msg(ctx) << "[amdgpu-rdc-isa] Aggregated " << devfuncCount
+             << " device functions (of " << funcRsrcMap.size()
+             << " entries): vgpr_count=" << totalVGPR
+             << ", agpr_count=" << agpr
+             << ", sgpr_count=" << globalMax.numSGPRs
+             << ", scratch=" << globalMaxTotalScratch
+             << ", group_segment=" << globalMax.ldsSize
+             << ", accum_offset=" << accumOffset
+             << ", next_free_vgpr=" << nextFreeVGPR
+             << " [arch_vgpr=" << archVGPR
+             << ", kernels=" << kernelDescriptors.size() << "]";
   }
 
   // Step 4: For each kernel, walk the call graph to compute cross-TU
@@ -671,14 +702,26 @@ void AMDGPU::postRelocatePass() const {
       hasDynSizedStack = hasDynSizedStack || globalHasDynStack;
     }
 
+    // Several rsrc2/kcProps bits gate user-SGPR / runtime setup that the
+    // kernel prologue must match. They may only be cleared post-link, not
+    // set 0->1, or HSA will reject the code object.
+    uint16_t kcProps = read16le(kd.buf + KERNEL_CODE_PROPERTIES_OFFSET);
+    uint32_t rsrc2 = read32le(kd.buf + COMPUTE_PGM_RSRC2_OFFSET);
+    bool kdHasPrivateSegment =
+        AMDHSA_BITS_GET(rsrc2, COMPUTE_PGM_RSRC2_ENABLE_PRIVATE_SEGMENT);
+    bool kdHasDynStack =
+        AMDHSA_BITS_GET(kcProps, KERNEL_CODE_PROPERTY_USES_DYNAMIC_STACK);
+
     // Patch the kernel descriptor in the output buffer.
     if (maxLDS > read32le(kd.buf + GROUP_SEGMENT_FIXED_SIZE_OFFSET))
       write32le(kd.buf + GROUP_SEGMENT_FIXED_SIZE_OFFSET, maxLDS);
-    if (maxScratch > read32le(kd.buf + PRIVATE_SEGMENT_FIXED_SIZE_OFFSET))
+    // Only grow the scratch byte count when ENABLE_PRIVATE_SEGMENT is
+    // already set; otherwise the prologue and user-SGPRs are not set up to
+    // access scratch and growing the value would be unsafe.
+    if (kdHasPrivateSegment &&
+        maxScratch > read32le(kd.buf + PRIVATE_SEGMENT_FIXED_SIZE_OFFSET))
       write32le(kd.buf + PRIVATE_SEGMENT_FIXED_SIZE_OFFSET, maxScratch);
 
-    // Read wave size from kernel_code_properties to pick the right granularity.
-    uint16_t kcProps = read16le(kd.buf + KERNEL_CODE_PROPERTIES_OFFSET);
     bool isWave32 = AMDHSA_BITS_GET(kcProps,
         KERNEL_CODE_PROPERTY_ENABLE_WAVEFRONT_SIZE32);
 
@@ -725,12 +768,19 @@ void AMDGPU::postRelocatePass() const {
       }
     }
 
-    // Clear USES_DYNAMIC_STACK if no reachable function uses alloca.
-    if (!hasDynSizedStack) {
-      if (AMDHSA_BITS_GET(kcProps, KERNEL_CODE_PROPERTY_USES_DYNAMIC_STACK)) {
-        AMDHSA_BITS_SET(kcProps, KERNEL_CODE_PROPERTY_USES_DYNAMIC_STACK, 0);
-        write16le(kd.buf + KERNEL_CODE_PROPERTIES_OFFSET, kcProps);
-      }
+    // Clear USES_DYNAMIC_STACK if the aggregated call tree doesn't need it.
+    // We never set this bit 0->1 because the prologue setup it requires
+    // cannot be added post-link.
+    if (kdHasDynStack && !hasDynSizedStack) {
+      AMDHSA_BITS_SET(kcProps, KERNEL_CODE_PROPERTY_USES_DYNAMIC_STACK, 0);
+      write16le(kd.buf + KERNEL_CODE_PROPERTIES_OFFSET, kcProps);
+    }
+
+    // Clear ENABLE_PRIVATE_SEGMENT when no aggregated callee uses scratch,
+    // mirroring the same "clear only" constraint.
+    if (kdHasPrivateSegment && maxScratch == 0) {
+      AMDHSA_BITS_SET(rsrc2, COMPUTE_PGM_RSRC2_ENABLE_PRIVATE_SEGMENT, 0);
+      write32le(kd.buf + COMPUTE_PGM_RSRC2_OFFSET, rsrc2);
     }
 
     // Record patched values for .note metadata patching (Step 5).

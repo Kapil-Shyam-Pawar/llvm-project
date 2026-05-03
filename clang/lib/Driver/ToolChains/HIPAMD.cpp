@@ -276,8 +276,6 @@ void HIPAMDToolChain::addClangTargetOptions(
 
   if (IsRDCISA) {
     CC1Args.append({"-mllvm", "-amdgpu-rdc-isa"});
-    // LowerModuleLDS destroys symbol names needed for cross-TU LDS linking.
-    CC1Args.append({"-mllvm", "-amdgpu-enable-lower-module-lds=0"});
   }
 
   StringRef MaxThreadsPerBlock =
